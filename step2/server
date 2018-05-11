@@ -1,0 +1,42 @@
+#!/usr/bin/env python2
+
+import socket, sys, time, json, threading, random
+def start_udp():
+	ports = []
+	loss_rate = float(sys.argv[2])
+	for i in range(3, len(sys.argv)):
+		ports.append(int(sys.argv[i]))
+	for port in ports:
+		sthread = threading.Thread(target = udp_thread, args = (port, loss_rate,))
+		sthread.start()
+
+def udp_thread(port, loss_rate):
+	address = ('127.0.0.1', port)
+	s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+	s.bind(address)
+
+	while True:
+	    data, addr = s.recvfrom(2048)
+	    if not data:
+	        print "client has exist"
+	        break
+	    print "received:", data, "from", addr
+	    data = json.loads(data)
+	    ack = int(data["SEQ"])
+	    ack += 1
+	    respond = {}
+	    respond["uni"] = "xz2663"
+	    respond["SEQ"] = -1
+	    respond["ACK"] = ack
+	    respond["Data"] = {}
+	    print "respond at: " + str(time.time())
+	    print json.dumps(respond)
+	    randomNum = random.random()
+	    if randomNum < loss_rate:
+	    	continue
+	    s.sendto(json.dumps(respond), addr)
+	s.close()
+
+if __name__ == "__main__":
+    start_udp()
+

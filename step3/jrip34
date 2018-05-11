@@ -1,0 +1,262 @@
+#!/usr/bin/env python2
+
+import socket, sys, time, random, json, thread
+
+def map_stuff():
+    global RIP_table, neighbor, address_map, udp_socket, host_port, window_size, data_window, period, timeout, my_ipaddr, arguments
+
+    my_ipaddr = '127.0.0.1' + ':' + str(host_port)
+    servers = arguments[3:][:]
+    for server in servers:
+        server_name = server.split(':')[0]
+        server_port = server.split(':')[1]
+        ipaddr = []
+        ipaddr.append(socket.gethostbyname(server_name))
+        ipaddr.append(':')
+        ipaddr.append(server_port)
+        ipaddr = ''.join(ipaddr)
+        RIP_table[ipaddr] = {"Next":ipaddr, "Cost": int(server.split(':')[-1])}
+        neighbor.append(ipaddr)
+        address_map[ipaddr] = {"next_seq":0, "seq":0, "last_ACK": time.time(), "base":0, "expected_seq":0, "sent_cnt":0, "buffer":[], "window":[]}
+        
+
+
+def client():
+    global buffer_size, packet_num, udp_socket, arguments, servers
+    buffer_size = 4096
+    
+    map_stuff()
+
+    thread.start_new_thread(handle_timeout, ())
+    thread.start_new_thread(handle_response, ())
+    thread.start_new_thread(send_packet, ())
+
+    while(True):
+        try: 
+            data, addr = udp_socket.recvfrom(buffer_size)
+            recv_addr = []
+            recv_addr.append(str(addr[0]))
+            recv_addr.append(':')
+            recv_addr.append(str(addr[1]))
+            addr = ''.join(recv_addr)
+            if 'resend' not in data:
+                data_window.append([data, addr])
+        except KeyboardInterrupt:
+            try:
+                udp_socket.close()
+                sys.exit(1)
+            except socket.error:
+                sys.exit(1)
+
+
+def send_packet():
+    global address_map, udp_socket, window_size
+    while True:
+        for addr, value in address_map.iteritems():
+            ipaddr, port = addr.split(':')
+            port = int(port)
+            while (value["next_seq"] < value["base"] + window_size) and value["buffer"]: # the GBN principle
+                value["next_seq"] += 1
+                data = json.loads(value["buffer"][0])
+                data["ACK"] = value["expected_seq"]
+                value["window"].append(data)
+                udp_socket.sendto(json.dumps(data), (ipaddr, port))
+                value["buffer"].pop(0)
+                
+def handle_response():
+    global RIP_table, neighbor, address_map, udp_socket, my_ipaddr, data_window, period
+    latest_sendtime = time.time()
+    while True:
+        if len(data_window) > 0:
+            data, addr = data_window.pop(0)
+            # map_addr = address_map[addr]
+            data = json.loads(data)
+            if(data["SEQ"] > -2 and data["SEQ"] < 0): 
+                while(data["ACK"] > address_map[addr]["base"]):
+                    address_map[addr]["last_ACK"] = time.time()
+                    if len(address_map[addr]["window"]) > 0:
+                        address_map[addr]["window"].pop(0)
+                    address_map[addr]["base"] += 1
+
+            else:
+                if (address_map.__contains__(addr)) :
+                    while(data["ACK"] > address_map[addr]["base"]):
+                        address_map[addr]["last_ACK"] = time.time()
+                        if len(address_map[addr]["window"]) > 0:
+                            address_map[addr]["window"].pop(0)
+                        address_map[addr]["base"] += 1
+                if (not address_map.__contains__(addr)) or data["SEQ"] == address_map[addr]["expected_seq"]:
+                    if data["Data"]["Type"] != "TRACE" :
+                        refresh_table(addr, data)
+                        address_map[addr]["expected_seq"] +=1
+                        ack_data = build_json(0,0,0,0, -1, address_map[addr]["expected_seq"])
+                        new_host = str(addr.split(':')[0])
+                        new_port = int(addr.split(':')[1])
+                        udp_socket.sendto(json.dumps(ack_data), (new_host, new_port))
+                    else:
+                        if data["Data"]["Type"] != "JRIP" :
+                            
+                            if data["Data"]["Origin"] == my_ipaddr and (data["Data"]["Destination"] in data["Data"]["TRACE"]): 
+                                address_map[addr]["expected_seq"] +=1
+                                ack_data = build_json(0,0,0,0, -1, address_map[addr]["expected_seq"])
+                                new_host = str(addr.split(':')[0])
+                                new_port = int(addr.split(':')[1])
+                                new_host_trace = str(addr_trace.split(':')[0])
+                                new_port_trace = int(addr_trace.split(':')[1])
+                                udp_socket.sendto(json.dumps(ack_data), (new_host, new_port))
+                                udp_socket.sendto(json.dumps(data), (new_host_trace, new_port_trace))
+                            else:
+                                condition1 = data["Data"]["Origin"] == my_ipaddr
+                                condition2 = data["Data"]["Destination"] == my_ipaddr
+                                if(condition1 and condition2):
+                                    data["Data"]["TRACE"].insert(len(data["Data"]["TRACE"])+1 ,my_ipaddr) 
+                                    new_host = str(addr.split(':')[0])
+                                    new_port = int(addr.split(':')[1])
+                                    udp_socket.sendto(json.dumps(data), (new_host, new_port))
+                                else:
+                                    
+                                    if data["Data"]["Origin"] == my_ipaddr and (data["Data"]["Destination"] in RIP_table) :
+                                        nexthop = RIP_table[data["Data"]["Destination"]]["Next"]
+                                        addr_trace = addr
+                                        data["Data"]["TRACE"].insert(len(data["Data"]["TRACE"])+1 ,my_ipaddr) 
+                                    else:
+                                        
+                                        if data["Data"]["Destination"] in data["Data"]["TRACE"] and (data["Data"]["Origin"] in RIP_table) :
+                                            nexthop = RIP_table[data["Data"]["Origin"]]["Next"]
+                                        else:
+                                            if data["Data"]["Destination"] == my_ipaddr and data["Data"]["Origin"] in RIP_table:
+                                                nexthop = RIP_table[data["Data"]["Origin"]]["Next"]
+                                                data["Data"]["TRACE"].insert(len(data["Data"]["TRACE"])+1 ,my_ipaddr)
+                                            else:
+                                                if data["Data"]["Destination"] in RIP_table:
+                                                    nexthop = RIP_table[data["Data"]["Destination"]]["Next"]
+                                                    data["Data"]["TRACE"].insert(len(data["Data"]["TRACE"])+1,my_ipaddr)
+                                        address_map[addr]["expected_seq"] +=1
+                                        ack_data = build_json(0,0,0,0, -1, address_map[addr]["expected_seq"])
+                                        new_host = str(addr.split(':')[0])
+                                        new_port = int(addr.split(':')[1])
+                                        udp_socket.sendto(json.dumps(ack_data), (new_host, new_port))
+
+                                    new_nexthop = address_map[nexthop]
+                                    data["SEQ"] = new_nexthop["seq"]
+                                    address_map[nexthop]["seq"] += 1
+                                    address_map[nexthop]["buffer"].insert(len(address_map[nexthop]["buffer"])+1,json.dumps(data))
+                else:
+                    ack_data = build_json(0,0,0,0, -1, address_map[addr]["expected_seq"])
+                    new_host = str(addr.split(':')[0])
+                    new_port = int(addr.split(':')[1])
+                    udp_socket.sendto(json.dumps(ack_data), (new_host, new_port))
+            
+        until_last_send = time.time() - latest_sendtime
+        if until_last_send > period:
+            Next = list()
+            Dest = list()
+            Cost = list()
+            for addr in RIP_table:
+                Next.insert(len(Next)+1,RIP_table[addr]["Next"])
+                Cost.insert(len(Cost)+1,str(RIP_table[addr]["Cost"]))
+                Dest.insert(len(Dest)+1,addr)
+            for addr in neighbor:
+                data = build_json(Dest, Next, Cost, "JRIP", address_map[addr]["seq"], -1)
+                address_map[addr]["seq"] += 1
+                address_map[addr]["buffer"].insert(len(address_map[addr]["buffer"])+1,json.dumps(data))
+            latest_sendtime = time.time()
+            print "[IP/PORT DESTINATION] [DISTANCE] [NEXT_HOP]"
+            for i in RIP_table:
+                print str(i)+"         "+str(RIP_table[i]["Cost"])+" "*(11-len(str(RIP_table[i]["Cost"])))+str(RIP_table[i]["Next"])
+
+
+def handle_timeout():
+    global address_map, udp_socket, timeout    
+    while True:
+        for address, value in address_map.iteritems() :
+            if((time.time() - value["last_ACK"]) > timeout): 
+                for i in value["window"]:
+                   udp_socket.sendto(json.dumps(i),socketaddr(address))
+                value["last_ACK"] = time.time()
+
+def socketaddr(string):
+    return (str(string.split(':')[0]), int(string.split(':')[1]))
+
+
+def refresh():
+    global RIP_table, neighbor
+    Next = list()
+    Dest = list()
+    Cost = list()
+    for addr in RIP_table:
+        Next.insert(len(Next)+1, RIP_table[addr]["Next"])
+        Cost.insert(len(Cost)+1, str(RIP_table[addr]["Cost"]))
+        Dest.insert(len(Dest)+1, addr)
+    for addr in neighbor: 
+        #data = build_json( Dest, Next, Cost, "JRIP", address_map[addr]["seq"], 0)
+        address_map[addr]["buffer"].insert(len(address_map[addr]["buffer"])+1,json.dumps(build_json( Dest, Next, Cost, "JRIP", address_map[addr]["seq"], 0)))
+        address_map[addr]["seq"] += 1
+    return
+
+def build_json(Dest, Next, Cost, Type, Seq, Ack):
+    js = {"uni": "xz2663"}
+    js.update({"SEQ": Seq}) 
+    js.update({"ACK": Ack})
+    js.update({"Data": {}})
+    table = {}
+    if(Type == "JRIP"):
+        table.update({"Type": "JRIP"})
+        table["RIPTable"] = []       
+        for i in range(len(Dest)):
+            tmp = {"Dest": Dest[i]}
+            tmp.update({"Next": Next[i]})
+            tmp.update({"Cost": Cost[i]})
+            table["RIPTable"].append(tmp)
+    else: 
+        if (Type == "TRACE"):
+            table["Type"] = Type
+    js["Data"] = table 
+    return js
+
+def refresh_table(addr, data):
+    global RIP_table, neighbor, window_size, address_map, my_ipaddr
+    seq = data["SEQ"]
+    
+    for rip_item in data["Data"]["RIPTable"]:
+        if rip_item["Dest"] in RIP_table:
+            if  int(rip_item["Cost"]) + RIP_table[addr]["Cost"]< RIP_table[rip_item["Dest"]]["Cost"]:
+                refresh()
+                RIP_table[rip_item["Dest"]]["Cost"] = int(rip_item["Cost"]) + RIP_table[addr]["Cost"]
+                RIP_table[rip_item["Dest"]]["Next"] = RIP_table[addr]["Next"]
+        else:
+            if rip_item["Dest"] != my_ipaddr:
+                refresh()
+                cost = int(rip_item["Cost"]) + RIP_table[addr]["Cost"]
+                RIP_table[rip_item["Dest"]] = {"Next":addr,"Cost":cost}
+    return
+
+def main():
+    global RIP_table, neighbor, address_map, udp_socket, host_port, window_size, data_window, period, timeout, my_ipaddr, arguments
+    
+    RIP_table = {}
+    period = 10
+    timeout = 1 
+    address_map = {}
+    neighbor = list()
+    data_window = list()
+    window_size = 5
+
+    arguments = sys.argv
+
+    if(len(arguments) < 4 or arguments[1] != '-p'):
+        print "Usage: ./jrip34 -p [port] [ip:port:cost]' "
+        sys.exit(1)
+
+    host_port = arguments[2]
+    host_port = int(host_port)
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.bind(('', host_port))
+
+    
+    client()
+
+
+
+if __name__ == "__main__":
+    main()
